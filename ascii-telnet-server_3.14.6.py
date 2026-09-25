@@ -29,7 +29,8 @@
 
 """
   ASCII art movie Telnet player.
-  Version         : 0.3  (HTML stats, reverse DNS, IP auto-ban)
+  Version         : 0.4  (HTML stats, reverse DNS, IP auto-ban, manual ban,
+                          auto-purge of disconnected clients)
 
   Can stream an ~20 minutes ASCII movie via Telnet emulation
   as stand alone server or via xinetd daemon.
@@ -57,7 +58,7 @@ import argparse
 
 ###############################################################################
 MAXDIM = (80, 24)   # maximum dimension of the VT100 terminal
-MAX_CLIENTS = 20    # maximum number of simultaneous client connections
+MAX_CLIENTS = 10    # maximum number of simultaneous client connections
 
 _START_TIME = time.time()
 
@@ -203,7 +204,13 @@ class StatsRegistry:
     """
         Thread-safe, in-memory statistics registry.
         Nothing is written to disk: everything is lost when the process exits.
+
+        A tiny background "reaper" purges entries of disconnected clients
+        CLOSED_TTL seconds after their end_time, so the dashboard doesn't
+        accumulate a growing tail of dead connections.
     """
+
+    CLOSED_TTL = 8.0      # seconds to keep a closed client in the list
 
     _lock = threading.Lock()
     _clients = {}                 # client_id -> ClientStats
@@ -211,8 +218,39 @@ class StatsRegistry:
     _total_connections = 0
     _total_bytes = 0
 
+    _reaper_started = False
+    _reaper_lock = threading.Lock()
+
+    # ---- lifecycle ----------------------------------------------------------
+    @classmethod
+    def _ensure_reaper(cls):
+        if cls._reaper_started:
+            return
+        with cls._reaper_lock:
+            if cls._reaper_started:
+                return
+            cls._reaper_started = True
+            threading.Thread(target=cls._reaper_loop,
+                             name="stats-reaper", daemon=True).start()
+
+    @classmethod
+    def _reaper_loop(cls):
+        while True:
+            time.sleep(2.0)
+            now = time.time()
+            with cls._lock:
+                dead = [
+                    cid for cid, c in cls._clients.items()
+                    if (not c.active) and c.end_time is not None
+                    and (now - c.end_time) > cls.CLOSED_TTL
+                ]
+                for cid in dead:
+                    del cls._clients[cid]
+
+    # ---- public API ---------------------------------------------------------
     @classmethod
     def register(cls, ip, port):
+        cls._ensure_reaper()
         with cls._lock:
             cid = cls._next_id
             cls._next_id += 1
@@ -298,6 +336,7 @@ class BanRegistry:
             the Telnet endpoint.
           * More than BAN_CONN_THRESHOLD new TCP connections from the same IP
             within BAN_CONN_WINDOW seconds triggers a ban as well.
+          * Manual bans (from the dashboard) are also stored here.
 
         Bans live in memory only and are gone when the process exits.
         Repeat offences extend the ban and increment the "hits" counter.
@@ -335,6 +374,17 @@ class BanRegistry:
                 del cls._bans[ip]
                 return None
             return dict(b)
+
+    # ---- manual ban ---------------------------------------------------------
+    @classmethod
+    def ban_manual(cls, ip, reason="manual ban by operator"):
+        """
+            Bans an IP immediately, regardless of heuristics.
+            The caller is responsible for kicking any currently active
+            connection (see ActiveConnections.kick).
+        """
+        with cls._lock:
+            cls._ban_locked(ip, reason)
 
     # ---- event hooks --------------------------------------------------------
     @classmethod
@@ -439,6 +489,46 @@ class BanRegistry:
 
 
 ###############################################################################
+#  Registry of currently connected handlers (for manual kick / ban)
+###############################################################################
+class ActiveConnections:
+    """
+        Keeps track of live TelnetRequestHandler instances, indexed by client
+        IP. Used by the dashboard's manual-ban button: the HTTP thread has no
+        direct reference to the telnet connection, so it asks this registry
+        to poke the handler's stop_event and shut its socket down.
+    """
+    _lock = threading.Lock()
+    _by_ip = {}   # ip -> set of handler objects
+
+    @classmethod
+    def add(cls, ip, handler):
+        with cls._lock:
+            cls._by_ip.setdefault(ip, set()).add(handler)
+
+    @classmethod
+    def remove(cls, ip, handler):
+        with cls._lock:
+            s = cls._by_ip.get(ip)
+            if not s:
+                return
+            s.discard(handler)
+            if not s:
+                cls._by_ip.pop(ip, None)
+
+    @classmethod
+    def kick(cls, ip):
+        """Ask every live handler for this IP to stop and drop its socket."""
+        with cls._lock:
+            handlers = list(cls._by_ip.get(ip, ()))
+        for h in handlers:
+            try:
+                h._terminate()
+            except Exception:
+                pass
+
+
+###############################################################################
 #  Asynchronous reverse-DNS resolver (single worker thread + cache)
 ###############################################################################
 class DNSResolver:
@@ -450,7 +540,6 @@ class DNSResolver:
 
     @classmethod
     def _ensure_worker(cls):
-        # double-checked locking; cheap
         if cls._worker_started:
             return
         with cls._lock:
@@ -493,7 +582,6 @@ class DNSResolver:
 
 
 ###############################################################################
-###############################################################################
 class TelnetRequestHandler(socketserver.StreamRequestHandler):
     """
         Request handler used for multi threaded TCP server
@@ -510,6 +598,9 @@ class TelnetRequestHandler(socketserver.StreamRequestHandler):
             player immediately, so the stats reflect reality right away.
         The watcher is started even when --no-ban is given, otherwise a
         graceful disconnect would not be noticed until the movie ends.
+
+        Every live handler also registers itself in ActiveConnections, which
+        allows the dashboard to kick a specific client (manual ban).
     """
 
     filename = None  # filename is set once, so it's immutable and safe for multi threading
@@ -543,7 +634,8 @@ class TelnetRequestHandler(socketserver.StreamRequestHandler):
 
         stats = StatsRegistry.register(ip, port)
         stop_event = threading.Event()
-        self._stop_event = stop_event   # used by onNextFrame and _terminate
+        self._stop_event = stop_event   # used by onNextFrame, _watch_input, _terminate
+        ActiveConnections.add(ip, self)
 
         # 4) watcher — always on, it also detects graceful disconnects
         watcher = threading.Thread(
@@ -567,6 +659,7 @@ class TelnetRequestHandler(socketserver.StreamRequestHandler):
                 self.connection.shutdown(socket.SHUT_RDWR)
             except Exception:
                 pass
+            ActiveConnections.remove(ip, self)
             StatsRegistry.unregister(stats)
             TelnetRequestHandler._client_semaphore.release()
 
@@ -574,7 +667,8 @@ class TelnetRequestHandler(socketserver.StreamRequestHandler):
     def _terminate(self):
         """
             Ask the player to stop and unblock any pending socket I/O.
-            Safe to call from any thread, idempotent.
+            Safe to call from any thread (e.g. the dashboard's ban button),
+            idempotent.
         """
         try:
             self._stop_event.set()
@@ -605,8 +699,8 @@ class TelnetRequestHandler(socketserver.StreamRequestHandler):
         """
             Reads whatever the client sends. A healthy viewer sends nothing;
             a brute-forcer or a scanner will eventually emit payload.
-            Regardless of the exit reason (EOF, ban, socket error), the
-            player is stopped so the client disappears from "online" stats.
+            Regardless of the exit reason (EOF, ban, socket error, kick),
+            the player is stopped so the client stops counting as "online".
         """
         try:
             while not stop_event.is_set():
@@ -633,6 +727,7 @@ class TelnetRequestHandler(socketserver.StreamRequestHandler):
                 self.connection.shutdown(socket.SHUT_RDWR)
             except Exception:
                 pass
+
 
 ###############################################################################
 class VT100Player:
@@ -787,6 +882,7 @@ STATS_HTML_PAGE = """<!DOCTYPE html>
   button:hover { background: #30363d; }
   button.danger { border-color: #f85149; color: #ff7b72; }
   button.danger:hover { background: #3d1418; }
+  button.tiny { padding: 3px 8px; font-size: 12px; }
   .status { color: #8b949e; font-size: 13px; }
   .empty { color: #8b949e; padding: 12px; }
   .reason { color: #ffb3ad; font-size: 12px; }
@@ -815,11 +911,11 @@ STATS_HTML_PAGE = """<!DOCTYPE html>
       <tr>
         <th>#</th><th>Status</th><th>IP / Hostname</th>
         <th>Connected at</th><th>Duration</th>
-        <th>Frames</th><th>In</th><th>Out</th><th>Rate</th>
+        <th>Frames</th><th>In</th><th>Out</th><th>Rate</th><th></th>
       </tr>
     </thead>
     <tbody id="rows">
-      <tr><td class="empty" colspan="9">нет данных</td></tr>
+      <tr><td class="empty" colspan="10">нет данных</td></tr>
     </tbody>
   </table>
 
@@ -890,7 +986,7 @@ STATS_HTML_PAGE = """<!DOCTYPE html>
     // ---- clients ----
     const rows = el("rows");
     if (!d.clients.length) {
-      rows.innerHTML = '<tr><td class="empty" colspan="9">нет данных</td></tr>';
+      rows.innerHTML = '<tr><td class="empty" colspan="10">нет данных</td></tr>';
     } else {
       const clients = d.clients.slice().sort((a, b) => {
         if (a.active !== b.active) return a.active ? -1 : 1;
@@ -899,6 +995,9 @@ STATS_HTML_PAGE = """<!DOCTYPE html>
       let html = "";
       for (const c of clients) {
         const rate = c.duration > 0 ? (c.bytes_sent / c.duration) : 0;
+        const banBtn = c.active
+          ? '<button class="danger tiny" data-banip="' + esc(c.ip) + '">Ban</button>'
+          : '';
         html += '<tr class="' + (c.active ? "active" : "idle") + '">'
           + '<td class="num">' + c.id + '</td>'
           + '<td><span class="dot ' + (c.active ? "on" : "off") + '"></span>'
@@ -910,9 +1009,21 @@ STATS_HTML_PAGE = """<!DOCTYPE html>
           + '<td class="num">' + fmtBytes(c.input_bytes || 0) + '</td>'
           + '<td class="num">' + fmtBytes(c.bytes_sent) + '</td>'
           + '<td class="num">' + fmtBytes(rate) + '/s</td>'
+          + '<td>' + banBtn + '</td>'
           + '</tr>';
       }
       rows.innerHTML = html;
+      rows.querySelectorAll("button[data-banip]").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          const ip = btn.getAttribute("data-banip");
+          if (!confirm("Забанить " + ip + " и отключить клиента?")) return;
+          try {
+            await fetch("/api/ban?ip=" + encodeURIComponent(ip),
+                        { cache: "no-store" });
+          } catch (e) {}
+          refresh();
+        });
+      });
     }
 
     // ---- bans ----
@@ -928,7 +1039,7 @@ STATS_HTML_PAGE = """<!DOCTYPE html>
           + '<td class="num">' + esc(b.banned_at) + '</td>'
           + '<td class="num">' + fmtDuration(b.expires_in) + '</td>'
           + '<td class="num">' + b.hits + '</td>'
-          + '<td><button class="danger" data-ip="' + esc(b.ip) + '">Unban</button></td>'
+          + '<td><button class="danger tiny" data-ip="' + esc(b.ip) + '">Unban</button></td>'
           + '</tr>';
       }
       brows.innerHTML = html;
@@ -965,10 +1076,11 @@ class StatsHTTPHandler(http.server.BaseHTTPRequestHandler):
         Minimal HTTP handler:
             /              -> HTML dashboard
             /api/stats     -> JSON snapshot (clients + bans)
+            /api/ban?ip=   -> manual ban + kick, returns {"ok":true}
             /api/unban?ip= -> lift a ban, returns {"ok":true}
     """
 
-    server_version = "AsciiTelnetStats/1.1"
+    server_version = "AsciiTelnetStats/1.2"
 
     def log_message(self, fmt, *args):
         # keep the console clean, we already print our own messages
@@ -1003,6 +1115,15 @@ class StatsHTTPHandler(http.server.BaseHTTPRequestHandler):
                 b["hostname"] = DNSResolver.get(b["ip"])
             data = json.dumps(snap, ensure_ascii=False).encode("utf-8")
             self._send(data, "application/json; charset=utf-8")
+
+        elif path == "/api/ban":
+            params = urllib.parse.parse_qs(query)
+            ip = (params.get("ip") or [""])[0].strip()
+            if ip:
+                BanRegistry.ban_manual(ip)
+                ActiveConnections.kick(ip)
+                sys.stderr.write("[ban] %s -> manual ban by operator\n" % ip)
+            self._send(b'{"ok":true}', "application/json; charset=utf-8")
 
         elif path == "/api/unban":
             params = urllib.parse.parse_qs(query)
@@ -1135,13 +1256,21 @@ def main():
     parser.add_argument(
         "--no-ban", dest="no_ban", action="store_true",
         help="Disable the built-in heuristic IP auto-ban "
-             "(incoming payload / connection flood)"
+             "(incoming payload / connection flood). "
+             "Manual bans via the dashboard are still allowed."
     )
     parser.add_argument(
         "--ban-duration", dest="ban_duration", metavar="SEC", type=int,
         default=int(BanRegistry.BAN_DURATION),
         help="How long (seconds) an offending IP stays banned "
              "(default %d)" % int(BanRegistry.BAN_DURATION)
+    )
+    parser.add_argument(
+        "--closed-ttl", dest="closed_ttl", metavar="SEC", type=int,
+        default=int(StatsRegistry.CLOSED_TTL),
+        help="How long (seconds) a disconnected client stays visible in the "
+             "dashboard before being removed (default %d)"
+             % int(StatsRegistry.CLOSED_TTL)
     )
 
     vgroup = parser.add_mutually_exclusive_group()
@@ -1164,6 +1293,7 @@ def main():
         no_http=False,
         no_ban=False,
         ban_duration=int(BanRegistry.BAN_DURATION),
+        closed_ttl=int(StatsRegistry.CLOSED_TTL),
     )
 
     options = parser.parse_args()
@@ -1171,8 +1301,9 @@ def main():
     if not (options.filename and os.path.exists(options.filename)):
         parser.exit(1, "Error, file not found! See --help for details.\n")
 
-    # configure ban subsystem
+    # configure subsystems
     BanRegistry.BAN_DURATION = float(options.ban_duration)
+    StatsRegistry.CLOSED_TTL = float(options.closed_ttl)
     TelnetRequestHandler.enable_ban = not options.no_ban
 
     if options.tcpserv:
@@ -1180,9 +1311,10 @@ def main():
             print("Running TCP server on %s:%d" % (options.interface, options.port))
             print("Playing movie " + options.filename)
             if options.no_ban:
-                print("Auto-ban: disabled")
+                print("Auto-ban: disabled (manual bans still work)")
             else:
                 print("Auto-ban: on (duration %ds)" % int(BanRegistry.BAN_DURATION))
+            print("Closed-client TTL: %ds" % int(StatsRegistry.CLOSED_TTL))
 
         if not options.no_http:
             httpd = runStatsServer(options.http_interface, options.http_port)

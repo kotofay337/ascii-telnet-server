@@ -7,8 +7,14 @@ rem python3 ascii-telnet-server.py -f movie.dat --http-interface 127.0.0.1 --htt
 rem # отключить бан (оставить только мониторинг)
 rem python3 ascii-telnet-server.py -f movie.dat --no-ban
 
-rem # снять бан вручную, не открывая браузер
+rem # забанить вручную
+rem curl "http://192.168.1.5:8080/api/ban?ip=10.0.0.42"
+
+rem # снять бан
 rem curl "http://192.168.1.5:8080/api/unban?ip=10.0.0.42"
+
+rem # запустить с TTL закрытых клиентов в 5 секунд
+rem python3 ascii-telnet-server.py -f movie.dat --closed-ttl 5
 
 python ascii-telnet-server_3.14.6.py  --http-interface 192.168.0.13 --ban-duration 1800 --standalone -f sw1.txt
 
